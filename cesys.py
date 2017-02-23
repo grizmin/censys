@@ -8,12 +8,16 @@ import threading
 import datetime
 import re
 import time
+import errno
+
 
 APIKEY = '32dbde8e-df83-45bb-971c-1abb494e62c5'
 SECRET = 'KWejBXEDvCokG9t6bW6N67CxgF5adndK'
+
+
 SQ = 'Netwave IP Camera'
-threadnum = 600
-entries = 10000
+threadnum = 100
+entries = 1000
 
 class Counter(object):
     def __init__(self, start=0):
@@ -31,12 +35,15 @@ class MyThread(threading.Thread):
         super(MyThread, self).__init__(group=group, target=target, name=name, args=args, kwargs=kwargs, verbose=verbose)
         self.threadLimiter = kwargs.pop('threadLimiter', None)
         self.counter = kwargs.pop('counter', None)
+        self.screenLock = kwargs.pop('screenLock', None)
 
     def run(self):
         self.threadLimiter.acquire()
         try:
             self.counter.increment()
+            self.screenLock.acquire()
             print('spawn thread {}'.format(self.counter.value))
+            self.screenLock.release()
             super(MyThread, self).run()
         finally:
             self.threadLimiter.release()
@@ -78,29 +85,31 @@ class SafeWrite():
     def __exit__(self, *args):
         self.close()
 
+class CheckSearchResult():
+    def __init__(self, ip, message = None, SQ = None, screenLock=None):
+        self.screenLock = screenLock
+        self.ip = ip
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.settimeout(2)
+        self.search_query = SQ
+        if not message:
+            self.message = "GET / HTTP/1.1\r\n\r\n"
+        else:
+            self.message = message
 
-sw = SafeWrite("alive")
-c = censys.ipv4.CensysIPv4(APIKEY, SECRET)
-payload = c.search(query=SQ, page=1, )
+    def _connect(self, the_socket, ip):
+        return the_socket.connect_ex((ip, 80))
 
-def signal_handler(signal, frame):
-    print('Closing file handlers..')
-    sw.close()
-    if sw.closed:
-        print('Done.')
-    sys.exit(0)
-signal.signal(signal.SIGINT, signal_handler)
+    def _send_timeout(self, the_socket, message, timeout=2):
+        the_socket.setblocking(0)
+        the_socket.settimeout(timeout)
+        try:
+            d = the_socket.sendall(message)
+        except socket.error:
+            print('Send failed')
+        return d
 
-alive = []
-
-def check_conn(ip, lock):
-    import errno
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(2)
-    result = sock.connect_ex((ip, 80))
-    message = "GET / HTTP/1.1\r\n\r\n"
-
-    def recv_timeout(the_socket, timeout=2):
+    def _recv_timeout(self, the_socket, timeout=2):
         the_socket.setblocking(0)
         total_data = [];
         data = '';
@@ -119,49 +128,70 @@ def check_conn(ip, lock):
                     begin = time.time()
                 else:
                     time.sleep(0.1)
-            except:
+            except Exception:
                 pass
         return ''.join(total_data)
 
-    if result == 0:
-        try:
-            sock.sendall(message)
-        except socket.error:
-            print('Send failed')
+    def check(self):
+        if not self._connect(self.sock,self.ip):
+            self._send_timeout(self.sock,self.message)
+            reply = self._recv_timeout(self.sock)
+            if self.search_query in reply:
+                self.screenLock.acquire()
+                print('{} is alive.'.format(self.ip))
+                # alive.append(ip)
+                # sw(ip)
+                self.screenLock.release()
+                self.sock.close()
+                return (self.ip)
 
-        try:
-            reply = recv_timeout(sock,timeout=4)
-
-        except socket.timeout as e:
-            pass
-        except socket.error as error:
-            if error.errno == errno.WSAECONNRESET:
-                print('Socket closed unexpectedly from remote')
-            else:
-                    pass
-        if SQ in reply:
-            lock.acquire()
-            print('{} is alive.'.format(ip))
-            alive.append(ip)
-            sw(ip)
-            lock.release()
-            sock.close()
-            return (ip)
-    else:
-        lock.acquire()
-        print('{} is unreachable.'.format(ip))
-        lock.release()
+        else:
+            self.screenLock.acquire()
+            print('{} is unreachable.'.format(self.ip))
+            self.sock.close()
+            self.screenLock.release()
 
 
-threads = []
-screenLock = threading.Semaphore(1)
-threadLimiter = threading.Semaphore(threadnum)
+c = censys.ipv4.CensysIPv4(APIKEY, SECRET)
+payload = c.search(query=SQ, page=1, )
 
+#thread safe counter
 counter = Counter()
+
+#thread safe file writer
+sw = SafeWrite("alive")
+
+#handle open files upon SIGINT
+def signal_handler(signal, frame):
+    print('Closing file handlers..')
+    sw.close()
+    if sw.closed:
+        print('Done.')
+    sys.exit(0)
+signal.signal(signal.SIGINT, signal_handler)
+
+#alive checked hosts
+alive = []
+
+#thread pool
+threads = []
+
+#semaphores preventing race conditions
+threadLimiter = threading.Semaphore(threadnum)
+screenLock = threading.Semaphore(1)
+
+def check(ip):
+    r = CheckSearchResult(ip,SQ=SQ,screenLock=screenLock).check()
+    if r:
+        sw(r)
+        alive.append(r)
+
+
+#start threading
 for i in range(entries):
     ip = payload.next()['ip']
     print('adding IP {}'.format(i))
-    threads.append(MyThread(name='Thread-{}'.format(i), target=check_conn, args=(ip, screenLock,), kwargs={'counter':counter,'threadLimiter':threadLimiter}))
+    threads.append(MyThread(name='Thread-{}'.format(i), target=check, args=(ip,), kwargs={'counter':counter,'threadLimiter':threadLimiter, 'screenLock':screenLock}))
 
 [t.start() for t in threads]
 [t.join() for t in threads]
